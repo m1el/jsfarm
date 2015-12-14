@@ -1,5 +1,6 @@
 functions = {};
 
+importScripts('jstree.js');
 importScripts('compile.js');
 
 function alert_(msg) {

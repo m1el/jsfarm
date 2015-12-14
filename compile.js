@@ -13,21 +13,6 @@ function unique_id() {
   return "id"+(idcounter++);
 }
 
-function js_tag_init(type, value) {
-  if (type == "float") {
-    if (""+parseInt(value, 10) == value) {
-      return value+".0";
-      // return "fround("+value+")";
-    } else if (""+parseFloat(value) == value) {
-      value = parseFloat(value).toFixed(20);
-      return value;
-      // return "fround("+value+")";
-    }
-  }
-}
-
-function tagf_init(arg) { return js_tag_init("float", arg); }
-
 function isFloat(arg) {
   if (""+parseFloat(arg) == arg ||
       ""+parseFloat(arg)+".0" == arg)
@@ -35,13 +20,6 @@ function isFloat(arg) {
     return true;
   }
   return false;
-}
-
-function coerce_int(arg) {
-  if (isFloat(arg)) {
-    return ""+(~~(parseFloat(arg, 10)));
-  }
-  return "~~"+paren_maybe(arg, "~");
 }
 
 function paren_maybe(ex, op) {
@@ -65,27 +43,6 @@ function paren_maybe(ex, op) {
   return "("+ex+")";
 }
 
-function js_tag(type, value) {
-  if (typeof value == "undefined") {
-    if (typeof type != "object") throw "what is "+typeof type+" "+type;
-    if (type.kind == "variable") {
-      value = type.value;
-      type = type.type;
-    } else if (type.kind == "number") {
-      var res = tagf_init(type.value);
-      if (res != null) return res;
-      throw "what why can't I tag init '"+type.value+"'";
-    } else throw "how tag "+type.kind;
-  }
-  if (type == "float") return "+"+paren_maybe(value, "+");
-  // if (type == "float") return "fround("+value+")";
-  if (type == "double") return "+"+paren_maybe(value, "+");
-  if (type == "int") return paren_maybe(value, "|")+"|0";
-  if (type == "bool") return paren_maybe(value, "|")+"|0";
-  throw "how tag "+type;
-  // return value;
-}
-
 function js_get_at(type, base, offs) {
   var shift = null, stackvar = null;
   if (type == "float") {
@@ -96,7 +53,8 @@ function js_get_at(type, base, offs) {
     stackvar = "stack_i32";
   } else throw "what is type "+type;
   
-  var target = stackvar+"[("+js_op("+", js_tag(base), offs)+") >> "+shift+"]";
+  var index = jst.binop(jst.binop(jst.fromval(base), '+', jst.fromval(offs), 'int'), '>>', jst.fromval(shift), 'int');
+  var target = jst.index(jst.symbol(stackvar), index);
   
   return {
     kind: "variable",
@@ -104,26 +62,6 @@ function js_get_at(type, base, offs) {
     value: target
   };
 };
-
-function js_tag_cast(type, thing) {
-  if (type == "float") {
-    if (thing.kind == "number" ||
-        thing.kind == "variable" && thing.type == "float")
-    {
-      return js_tag(thing);
-    }
-  }
-  return js_tag(type, js_tag(thing));
-}
-
-function js_op(op, a, b) {
-  // int ops
-  if (op == "<<" || op == ">>" || op == ">>>" || op == "&" || op == "|" || op == "^") {
-    a = coerce_int(a);
-    b = coerce_int(b);
-  }
-  return paren_maybe(a, op)+" "+op+" "+paren_maybe(b, op);
-}
 
 // turn a compound expression into an array of primitives
 function flatten(thing) {
@@ -613,6 +551,10 @@ function JsFile() {
     this.add(name, text);
     this.add(name, "\n");
   };
+  this.push = function(ast, section) {
+    section = section || null;
+    this.addLine(section, jst.serialize(ast) + ';');
+  };
   this.indent = function(section) { this.findSection(section).indentDepth ++; };
   this.unindent = function(section) { this.findSection(section).indentDepth --; };
   this.allocName = function(kind, hint) {
@@ -630,20 +572,16 @@ function JsFile() {
     
     var name = this.allocName("v", hint);
     // JavaScript
-    var initializer = js_tag_init(type, value);
-    if (initializer != null) {
-      this.addLine(location, "var "+name+" = "+initializer+";");
-    } else {
-      var sample = null;
-      if (type == "float") sample = tagf_init("0");
-      else if (type == "int") sample = "0";
-      else if (type == "bool") sample = "0";
-      else throw ("how init "+type+"?");
-      
-      this.addLine(location, "var "+name+" = "+sample+";");
-      if (value != null) {
-        this.set(type, name, value);
+    var initializer = value !== null && jst.fromval(value, type);
+    if (initializer) {
+      if (initializer.tag === 'literal') {
+        this.push(jst.vardecl(name, initializer, type), location);
+      } else {
+        this.push(jst.vardecl(name, jst.literal(null, type), type), location);
+        this.push(jst.binop(jst.fromval(name), '=', initializer));
       }
+    } else {
+      this.push(jst.vardecl(name, jst.literal(null, type), type), location);
     }
     // C
     /*if (init == "null") {
@@ -683,6 +621,9 @@ function JsFile() {
       };
     }
     if (typeof value == "object") {
+      if (value.tag) {
+        return jst.fake(this.allocVar(value, type, hint, location), type);
+      }
       if (value.kind == "number") {
         return {
           kind: "variable",
@@ -702,7 +643,9 @@ function JsFile() {
     throw "fuck";
   };
   this.set = function(type, target, value) {
-    this.addLine(target+" = "+js_tag(type, value)+";");
+    target = jst.fromval(target);
+    value = jst.fromval(value);
+    this.push(jst.binop(target, '=', value, type), null);
   };
 }
 
@@ -929,10 +872,10 @@ function compile(src) {
         }
         
         js.openSection("variables");
-        js.addLine("var BP = 0;");
+        js.push(jst.vardecl('BP', jst.literal(0, 'int')));
         
         js.openSection("body");
-        js.addLine("BP = SP;");
+        js.push(jst.binop('BP', '=', 'SP'));
         
         var abort = function() {
           // discard
@@ -962,8 +905,8 @@ function compile(src) {
         var res = callframe.eval(body);
         
         if (res == null) {
-          js.addLine("SP = BP;");
-          js.addLine("return");
+          js.push(jst.binop("SP", "=", "BP"));
+          js.push(jst.retn());
         }
         else if (typeof res == "function" ||
             res.kind == "struct"
@@ -987,12 +930,12 @@ function compile(src) {
             ret_value = {kind: "vec3f", value: {x:x.value, y:y.value, z:z.value}};
             ret_type = "vec3f";
           }
-          js.addLine("SP = BP;");
-          js.addLine("return");
+          js.push(jst.binop("SP", "=", "BP"));
+          js.push(jst.retn());
         }
         else if (res.kind == "variable" && (res.type == "float" || res.type == "bool")) {
-          js.addLine("SP = BP;");
-          js.addLine("return "+js_tag(res)+";");
+          js.push(jst.binop("SP", "=", "BP"));
+          js.push(jst.retn(jst.fromval(res)));
           ret_type = res.type;
         }
         else {
@@ -1016,20 +959,17 @@ function compile(src) {
       }
       
       // build call
-      var arglist = [];
-      for (var i = 0; i < flat_args.length; ++i) {
-        arglist.push(js_tag(flat_args[i]));
-      }
+      var arglist = flat_args.map(jst.fromval.bind(jst));
       
       if (arglist.length != partypes.length) callthing.fail("internal logic error");
       
-      var call = fn+" ("+arglist.join(",")+")";
+      var call = jst.fncall(jst.symbol(fn), arglist);
       
       if (ret_type == "float" || ret_type == "bool") {
         ret_value = js.mkVar(call, ret_type, "retval");
       }
       else if (ret_type == "vec3f") {
-        js.addLine(call+";");
+        js.push(call);
         // immediately copy the return vals elsewhere
         ret_value = {
           kind: "vec3f",
@@ -1039,7 +979,7 @@ function compile(src) {
             z: js.mkVar(ret_value.value.z, "float", "rcopy_z").value}};
       }
       else if (ret_type == null) {
-        js.addLine(call+";");
+        js.push(call);
       }
       else callthing.fail("TODO how return "+ret_type);
       
@@ -1219,15 +1159,14 @@ function compile(src) {
   });
   function doSetJs(js, thing, target, value) {
     if (target == null || value == null) thing.fail("what");
-    // fake it
-    if (value.kind == "number") {
-      value = {kind: "variable", type: "float", value: tagf_init(value.value)};
-    }
-    if (value.kind == "bool") {
-      value = {kind: "variable", type: "bool", value: value.value};
-    }
     
-    if (target.kind == "variable" && value.kind == "variable") {
+    if (value.kind == 'number' && !value.type) {
+      value = {kind: 'number', type: 'float', value: value.value};
+    }
+    if (value.kind == 'bool' && !value.type) {
+      value = {kind: 'bool', type: 'bool', value: value.value};
+    }
+    if (target.kind == "variable" && (value.kind == "variable" || value.kind == 'number' || value.kind == 'bool')) {
       if (target.type != value.type)
         thing.fail("mismatch: assigning "+value.type+" to "+target.type);
       js.set(target.type, target.value, value.value);
@@ -1318,7 +1257,7 @@ function compile(src) {
       js.indent();
       var test = context.eval(rest[0]);
       if (test.kind == "variable" && test.type == "bool") {
-        js.addLine("if (!"+paren_maybe(test.value, "!")+") break;");
+        js.push(jst.if_(jst.uop('!', test.value, 'bool'), jst.break_()));
       }
       else thing.fail("TODO test that's "+JSON.stringify(test));
       var res = context.eval(rest[1]);
@@ -1421,7 +1360,7 @@ function compile(src) {
       
       js.unindent();
       
-      js.addLine("if ("+js_tag(test)+") {");
+      js.addLine("if ("+jst.serialize(jst.fromval(test))+") {");
       js.add(case1_js);
       if (rest.length == 3) {
         js.addLine("} else {");
@@ -1451,11 +1390,11 @@ function compile(src) {
     if (!js) thing.fail("make-ray cannot be called at compiletime");
     var base = js.mkVar("SP", "int", "ray_base");
     
-    js.set("int", "SP", js_op("+", "SP", 32));
+    js.set("int", "SP", jst.binop('SP', "+", 32, 'int'));
     
     var get_fp_at = function(offs) {
       var res = js_get_at("float", base, offs);
-      js.set("float", res.value, "0");
+      js.set("float", res.value, 0);
       return res;
     };
     
@@ -1472,7 +1411,7 @@ function compile(src) {
   function mkRes(js) {
     var base = js.mkVar("SP", "int", "res_base");
     
-    js.set("int", "SP", js_op("+", "SP", 64));
+    js.set("int", "SP", jst.binop('SP', "+", 64, 'int'));
     
     var get_init = function(offs, type, init) {
       var res = js_get_at(type, base, offs);
@@ -1497,7 +1436,7 @@ function compile(src) {
       base: base,
       offsets: {success: 0, distance: 4, reflect: 16, emit: 32, normal: 48},
       value: {
-        success: get_init(0, "bool", "0"),
+        success: get_init(0, "bool", 0),
         // distance: get_init(4, "float", "0"),
         // reflect: get_vec_init(16, "0", "0", "0"),
         // emit: get_vec_init(32, "0", "1", "0"),
@@ -1511,33 +1450,33 @@ function compile(src) {
   addfun("make-res", 0, function(js, thing) { return mkRes(js); });
   addfun("sqrt", 1, function(js, thing, value) {
     if (value.kind == "variable" && value.type == "float") {
-      return js.mkVar("sqrt("+js_tag(value)+")", "float", "sqrt");
+      return js.mkVar(jst.fncall("sqrt", [jst.fromval(value)]), "float", "sqrt");
     }
     thing.fail("TODO sqrt "+JSON.stringify(value));
   });
   addfun("abs", 1, function(js, thing, value) {
     if (value.kind == "variable" && value.type == "float") {
-      return js.mkVar("abs("+js_tag(value)+")", "float", "abs");
+      return js.mkVar(jst.fncall("abs", [jst.fromval(value)]), "float", "abs");
     }
     if (value.kind == "number") return {kind: "number", value: Math.abs(value.value)};
     thing.fail("TODO abs "+JSON.stringify(value));
   });
   addfun("sin", 1, function(js, thing, value) {
     if (value.kind == "variable" && value.type == "float") {
-      return js.mkVar("sin("+js_tag(value)+")", "float", "sin");
+      return js.mkVar(jst.fncall("sin", [jst.fromval(value)]), "float", "sin");
     }
     if (value.kind == "number") return {kind: "number", value: Math.sin(value.value)};
     thing.fail("TODO sin "+JSON.stringify(value));
   });
   addfun("cos", 1, function(js, thing, value) {
     if (value.kind == "variable" && value.type == "float") {
-      return js.mkVar("cos("+js_tag(value)+")", "float", "cos");
+      return js.mkVar(jst.fncall("cos", [jst.fromval(value)]), "float", "cos");
     }
     thing.fail("TODO cos "+JSON.stringify(value));
   });
   addfun("tan", 1, function(js, thing, value) {
     if (value.kind == "variable" && value.type == "float") {
-      return js.mkVar("tan("+js_tag(value)+")", "float", "tan");
+      return js.mkVar(jst.fncall("tan", [jst.fromval(value)]), "float", "tan");
     }
     thing.fail("TODO tan "+JSON.stringify(value));
   });
@@ -1546,7 +1485,7 @@ function compile(src) {
       return {kind: "number", value: Math.floor(value.value)};
     }
     if (value.kind == "variable" && value.type == "float") {
-      return js.mkVar("floor("+js_tag(value)+")", "float", "floor");
+      return js.mkVar(jst.fncall("floor", [jst.fromval(value)]), "float", "floor");
     }
     thing.fail("TODO floor "+JSON.stringify(value));
   });
@@ -1563,7 +1502,7 @@ function compile(src) {
       var jsop = opname;
       if (opname == "=") jsop = "==";
       
-      return js.mkVar(js_op(jsop, js_tag(v1), js_tag(v2)), "bool", "cmp");
+      return js.mkVar(jst.binop(jst.fromval(v1), opname, jst.fromval(v2), "bool"), 'bool', "cmp");
     });
   }
   defCmp("<", function(a, b) { return a < b; });
@@ -1575,7 +1514,7 @@ function compile(src) {
   addfun("isfinite", 1, function(js, thing, value) {
     if (!js) thing.fail("TODO js");
     if (value.kind == "variable" && value.type == "float") {
-      return js.mkVar("isFinite(+("+value.value+"))|0", "bool", "isfinite");
+      return js.mkVar(jst.fncall("isFinite", [jst.fromval(value)]), "bool", "isFinite");
     }
     thing.fail("TODO isfinite of "+JSON.stringify(value));
   });
@@ -1585,7 +1524,7 @@ function compile(src) {
     }
     if (!js) thing.fail("TODO js");
     if (bool.kind == "variable" && bool.type == "bool") {
-      return js.mkVar("!"+paren_maybe(js_tag(bool), "!"), "bool", "not");
+      return js.mkVar(jst.uop('!', jst.fromval(bool)), "bool", "not");
     }
     thing.fail("TODO 'not' of "+JSON.stringify(bool));
   });
@@ -1671,16 +1610,16 @@ function compile(src) {
           var rv = res.value;
           var oper = array[i];
           if (oper.kind == "vec3f") {
-            js.set("float", rv.x, js_op(opname, js_tag("float", rv.x), js_tag("float", oper.value.x)));
-            js.set("float", rv.y, js_op(opname, js_tag("float", rv.y), js_tag("float", oper.value.y)));
-            js.set("float", rv.z, js_op(opname, js_tag("float", rv.z), js_tag("float", oper.value.z)));
+            js.set("float", rv.x, jst.binop(jst.fromval(rv.x), opname, jst.fromval(oper.value.x)));
+            js.set("float", rv.y, jst.binop(jst.fromval(rv.y), opname, jst.fromval(oper.value.y)));
+            js.set("float", rv.z, jst.binop(jst.fromval(rv.z), opname, jst.fromval(oper.value.z)));
           } else if (oper.kind == "variable" && oper.type == "float" ||
                      oper.kind == "number"
           ) {
-            var opn = js_tag_cast("float", oper);
-            js.set("float", rv.x, js_op(opname, js_tag("float", rv.x), opn));
-            js.set("float", rv.y, js_op(opname, js_tag("float", rv.y), opn));
-            js.set("float", rv.z, js_op(opname, js_tag("float", rv.z), opn));
+            var opn = jst.fromval(oper);
+            js.set("float", rv.x, jst.binop(jst.fromval(rv.x), opname, opn));
+            js.set("float", rv.y, jst.binop(jst.fromval(rv.y), opname, opn));
+            js.set("float", rv.z, jst.binop(jst.fromval(rv.z), opname, opn));
           } else {
             thing.fail("TODO vop "+JSON.stringify(oper));
           }
@@ -1693,7 +1632,7 @@ function compile(src) {
           if (oper.kind == "variable" && oper.type == "float" ||
               oper.kind == "number"
           ) {
-            js.set(res.type, res.value, js_op(opname, js_tag(res), js_tag(oper)));
+            js.set(res.type, res.value, jst.binop(jst.fromval(res), opname, jst.fromval(oper)));
           } else {
             thing.fail("TODO op "+JSON.stringify(oper));
           }
@@ -1717,19 +1656,19 @@ function compile(src) {
     if (a.kind == "number" && b.kind == "number") {
       return {kind: "number", value: a.value << b.value};
     }
-    return js.mkVar(js_op("<<", js_tag(a), js_tag(b)), "float", "lsh");
+    return js.mkVar(jst.binop(jst.fromval(a), "<<", jst.fromval(b), "float"), 'float', "lsh");
   });
   addfun(">>", 2, function(js, thing, a, b) {
     if (a.kind == "number" && b.kind == "number") {
       return {kind: "number", value: a.value >> b.value};
     }
-    return js.mkVar(js_op(">>", js_tag(a), js_tag(b)), "float", "rsh");
+    return js.mkVar(jst.binop(jst.fromval(a), ">>", jst.fromval(b), "float"), 'float', "rsh");
   });
   addfun(">>>", 2, function(js, thing, a, b) {
     if (a.kind == "number" && b.kind == "number") {
       return {kind: "number", value: a.value >>> b.value};
     }
-    return js.mkVar(js_op(">>>", js_tag(a), js_tag(b)), "float", "ursh");
+    return js.mkVar(jst.binop(jst.fromval(a), ">>>", jst.fromval(b), "float"), 'float', "ursh");
   });
   
   sysctx.add("true", {kind: "bool", value: 1});
@@ -1790,7 +1729,7 @@ function compile(src) {
     if (typeof value == "object" && value.kind == "number") {
       // bake in
       var jsname = jsfile.allocName("g", key);
-      jsfile.addLine("variables", "var "+jsname+" = "+js_tag_init("float", value.value)+";");
+      jsfile.push(jst.vardecl(jsname, jst.fromval(value, 'float')), "variables");
       context.table[key] = {kind: "variable", type: "float", value: jsname};
     }
   }
@@ -1806,10 +1745,10 @@ function compile(src) {
   
   jsfile.openSection("variables");
   
-  jsfile.addLine("var x = "+js_tag_init("float", "0")+";");
-  jsfile.addLine("var y = "+js_tag_init("float", "0")+";");
-  jsfile.addLine("var __i = 0;");
-  jsfile.addLine("var BP = 0;");
+  jsfile.push(jst.vardecl('x', jst.literal(0, 'float')));
+  jsfile.push(jst.vardecl('y', jst.literal(0, 'float')));
+  jsfile.push(jst.vardecl('__i', jst.literal(0, 'int')));
+  jsfile.push(jst.vardecl('BP', jst.literal(0, 'int')));
   
   callctx.add("x", {kind: "variable", type: "float", value: "x"});
   callctx.add("y", {kind: "variable", type: "float", value: "y"});
@@ -1818,8 +1757,8 @@ function compile(src) {
   
   jsfile.addLine("BP = SP|0;");
   
-  jsfile.addLine("x = "+js_tag("float", "ix|0")+";");
-  jsfile.addLine("y = "+js_tag("float", "iy|0")+";");
+  jsfile.push(jst.binop('x', '=', jst.symbol('ix', 'float')));
+  jsfile.push(jst.binop('y', '=', jst.symbol('iy', 'float')));
   
   var res = mkRes(jsfile);
   
@@ -1830,8 +1769,8 @@ function compile(src) {
     {kind: "atom", value: "res"},
   ]);
   var rvev = res.value.emit.value;
-  jsfile.addLine("hit(~~x, ~~y, "+js_tag("int", res.value.success.value)+", "+
-    js_tag("double", rvev.x)+", "+js_tag("double", rvev.y)+", "+js_tag("double", rvev.z)+");");
+  jsfile.addLine("hit(~~x, ~~y, "+jst.serialize(res.value.success.value)+", "+
+    jst.serialize(rvev.x)+", "+jst.serialize(rvev.y)+", "+jst.serialize(rvev.z)+");");
   
   jsfile.addLine("SP = BP|0;");
   
